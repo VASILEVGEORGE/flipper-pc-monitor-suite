@@ -1,0 +1,21 @@
+.DS_Store
+__pycache__/
+*.pyc
+
+# Rust
+target/
+
+# Flipper build output
+dist/
+build/
+*.elf
+*.fap
+
+# Logs / temp
+*.log
+*.tmp
+
+# Local backup files
+*.bak
+*.bak-*
+*.before-*
