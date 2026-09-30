@@ -1,0 +1,72 @@
+diff --git a/targets/f7/ble_glue/gap.c b/targets/f7/ble_glue/gap.c
+index 5ecbad781..a0beff1ad 100644
+--- a/targets/f7/ble_glue/gap.c
++++ b/targets/f7/ble_glue/gap.c
+@@ -654,7 +654,8 @@ void gap_update_advertising_battery(uint8_t battery_level) {
+        gap->service.mfg_data[2] == 0xFF &&
+        gap->service.mfg_data[3] == 0xFF &&
+        gap->service.mfg_data[4] == 0x46 &&
+-       gap->service.mfg_data[5] == 0x5A) {
++       gap->service.mfg_data[5] == 0x5A &&
++       gap->service.mfg_data[6] == 0x01) {
+ 
+         gap->service.mfg_data[7] =
+             battery_level;
+diff --git a/targets/f7/furi_hal/furi_hal_bt.c b/targets/f7/furi_hal/furi_hal_bt.c
+index f85ed6469..2d9c7c7a2 100644
+--- a/targets/f7/furi_hal/furi_hal_bt.c
++++ b/targets/f7/furi_hal/furi_hal_bt.c
+@@ -286,25 +286,41 @@ void furi_hal_bt_update_battery_level(uint8_t battery_level) {
+ }
+ 
+ void furi_hal_bt_update_advertising_flags(uint8_t flags) {
+-    GapState state = gap_get_state();
+-
+     /*
+-     * Always update the cached manufacturer payload.
+-     *
+-     * When connected there is no advertising, so the
+-     * new value will naturally be used after disconnect.
++     * Always refresh the cached manufacturer payload first. When
++     * connected there is no advertising, so the new value is used
++     * automatically after the next disconnect.
+      */
+     gap_update_advertising_flags(flags);
+ 
+     /*
+-     * If currently advertising, refresh it through the
+-     * normal GAP lifecycle.
+-     *
+-     * Do NOT call the raw HCI scan-response API here.
++     * If the BLE stack is down there is nothing live to refresh;
++     * the cache update above is enough. Avoids issuing HCI
++     * stop/start against an inactive controller.
++     */
++    if(!furi_hal_bt_is_active()) {
++        return;
++    }
++
++    /*
++     * Skip the heavy advertising restart when the flags value did
++     * not change. The FAP re-asserts the same flag on every launch;
++     * a needless stop/start briefly drops the advertisement and can
++     * disturb an in-progress connection.
+      */
+-    if(state == GapStateAdvFast ||
+-       state == GapStateAdvLowPower) {
++    static uint8_t last_flags = 0xFF;
++    if(flags == last_flags) {
++        return;
++    }
++    last_flags = flags;
+ 
++    /*
++     * Refresh advertising through the normal GAP lifecycle only
++     * while actually advertising. Do NOT call the raw HCI
++     * scan-response API here.
++     */
++    GapState state = gap_get_state();
++    if(state == GapStateAdvFast || state == GapStateAdvLowPower) {
+         furi_hal_bt_stop_advertising();
+         furi_hal_bt_start_advertising();
+     }
