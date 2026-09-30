@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-
 import os
+
 import argparse
 import asyncio
 import struct
@@ -1101,6 +1101,44 @@ class FlipperBLE:
         return files
 
 
+    async def read_file(self, path):
+
+        msg = flipper_pb2.Main()
+
+        req = msg.storage_read_request
+        req.path = path
+
+        frames = await self.request(
+            msg,
+            timeout=30
+        )
+
+        data = bytearray()
+
+        for frame in frames:
+
+            if frame.command_status != 0:
+                raise RuntimeError(
+                    "Storage read RPC error "
+                    f"{frame.command_status}"
+                )
+
+            if frame.HasField(
+                "storage_read_response"
+            ):
+
+                response = (
+                    frame.storage_read_response
+                )
+
+                if response.HasField("file"):
+                    data.extend(
+                        response.file.data
+                    )
+
+        return bytes(data)
+
+
 async def cmd_put(
     flipper,
     local_path,
@@ -1189,6 +1227,40 @@ async def cmd_battery(flipper):
     print(f"Battery: {battery}%")
 
 
+async def cmd_cat(flipper, path):
+
+    data = await flipper.read_file(path)
+
+    if not data:
+        return
+
+    try:
+        print(
+            data.decode("utf-8"),
+            end=""
+        )
+
+        if not data.endswith(b"\n"):
+            print()
+
+    except UnicodeDecodeError:
+        import sys
+        sys.stdout.buffer.write(data)
+
+
+async def cmd_log(flipper):
+
+    path = (
+        "/ext/apps_data/"
+        "pc_monitor/debug.log"
+    )
+
+    await cmd_cat(
+        flipper,
+        path
+    )
+
+
 async def cmd_ls(flipper, path):
 
     files = await flipper.ls(path)
@@ -1261,6 +1333,21 @@ async def main():
         "pcmon-start",
         help="Start PC Monitor using shared Flipper RPC session"
     )
+
+    cat_parser = sub.add_parser(
+        "cat",
+        help="Print a remote file"
+    )
+
+    cat_parser.add_argument(
+        "path"
+    )
+
+    sub.add_parser(
+        "log",
+        help="Show PC Monitor debug log"
+    )
+
 
     ls_parser = sub.add_parser(
         "ls",
@@ -1382,6 +1469,15 @@ async def main():
                     flipper,
                     args.path
                 )
+
+            elif args.command == "cat":
+                await cmd_cat(
+                    flipper,
+                    args.path
+                )
+
+            elif args.command == "log":
+                await cmd_log(flipper)
 
             elif args.command == "pcmon-start":
                 await flipper.pcmon_start()
