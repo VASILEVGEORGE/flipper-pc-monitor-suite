@@ -37,6 +37,7 @@ flipper-pc-monitor-suite/
 ├── flipper-fap/               Flipper Zero PC Monitor application
 ├── mac-backend/               Rust macOS telemetry + BLE/RPC backend
 ├── flipperble/                Python BLE RPC command-line client
+├── airbattery-helper/         AirBattery bridge helper for macOS
 ├── firmware/
 │   ├── README.md              Momentum firmware patch documentation
 │   └── patches/
@@ -83,6 +84,192 @@ flipper-pc-monitor-suite/
 ```
 
 `flipperble` is a separate command-line utility that talks to the same Flipper RPC service over BLE and is useful for deployment and diagnostics.
+
+
+
+## 3. Flipper AirBattery Helper
+
+Location:
+
+```text
+airbattery-helper/
+```
+
+The AirBattery integration exposes the Flipper Zero battery level to
+[AirBattery](https://github.com/lihaoyun6/AirBattery) on macOS without allowing
+AirBattery to create its own BLE connection to the Flipper.
+
+This is important because the PC Monitor backend is intended to remain the sole
+owner of the Flipper BLE/RPC connection.
+
+### Architecture
+
+```text
+                         Flipper Zero
+                              │
+                ┌─────────────┴─────────────┐
+                │                           │
+         BLE disconnected              BLE connected
+                │                           │
+                │ advertising               │ RPC/GATT
+                │ battery                   │ battery
+                ▼                           ▼
+        46 5A 01 BAT FLAGS        active BLE/RPC session
+                │                           │
+                └─────────────┬─────────────┘
+                              ▼
+                  flipper-pc-monitor-backend
+                              │
+                              │ update_airbattery()
+                              ▼
+                  /tmp/flipper-airbattery.json
+                              │
+                              ▼
+                 Flipper AirBattery Helper
+                              │
+                              ▼
+~/Library/Containers/com.lihaoyun6.AirBattery.widget/
+Data/Documents/NearcastData/FlipperZero.json
+                              │
+                              ▼
+                          AirBattery
+```
+
+### Disconnected mode
+
+When the Flipper is not connected over BLE/RPC, the backend reads the battery
+percentage from the PC Monitor manufacturer-specific advertising payload:
+
+```text
+46 5A 01 BAT FLAGS
+```
+
+The `BAT` byte contains the Flipper battery percentage.
+
+The backend publishes the value through:
+
+```text
+/tmp/flipper-airbattery.json
+```
+
+This means AirBattery can continue showing the Flipper battery without a
+persistent BLE connection.
+
+### Connected mode
+
+When the Flipper has an active BLE/RPC connection, normal BLE advertising is
+no longer the battery source.
+
+The backend obtains the current Flipper battery level from the active
+connection and calls the same `update_airbattery()` path.
+
+From AirBattery's point of view, nothing changes: both disconnected and
+connected modes update the same logical device entry.
+
+### Backend JSON
+
+The backend writes a JSON array containing the Flipper device entry.
+
+Example shape:
+
+```json
+[
+  {
+    "hasBattery": true,
+    "deviceID": "54594526E180",
+    "deviceType": "general_bt",
+    "deviceName": "TYECzer0",
+    "deviceModel": "Flipper Zero",
+    "batteryLevel": 83,
+    "isCharging": 0,
+    "isCharged": false,
+    "isPaused": false,
+    "acPowered": false,
+    "isHidden": false,
+    "lowPower": false,
+    "parentName": "",
+    "lastUpdate": 0,
+    "realUpdate": 0
+  }
+]
+```
+
+The backend writes atomically using:
+
+```text
+/tmp/flipper-airbattery.json.tmp
+```
+
+and then renames it to:
+
+```text
+/tmp/flipper-airbattery.json
+```
+
+### Flipper AirBattery Helper.app
+
+The helper is a small background macOS application.
+
+Bundle information used during development:
+
+```text
+Name:       Flipper AirBattery Helper
+Bundle ID:  bg.optimistas.FlipperAirBatteryHelper
+Version:    1.0
+UI mode:    LSUIElement=true
+```
+
+The helper does **not** access Bluetooth directly.
+
+It reads:
+
+```text
+/tmp/flipper-airbattery.json
+```
+
+and copies the data into AirBattery's NearCast directory:
+
+```text
+~/Library/Containers/com.lihaoyun6.AirBattery.widget/
+Data/Documents/NearcastData/FlipperZero.json
+```
+
+The write is also performed atomically through:
+
+```text
+FlipperZero.json.tmp
+```
+
+followed by rename to:
+
+```text
+FlipperZero.json
+```
+
+### Offline timeout
+
+The helper uses a 60-second freshness timeout.
+
+If:
+
+- `/tmp/flipper-airbattery.json` does not exist; or
+- the source file is older than 60 seconds,
+
+the helper removes the AirBattery entry.
+
+This prevents a stale Flipper battery percentage from remaining visible after
+the device or backend becomes unavailable.
+
+### Source
+
+The helper source lives in:
+
+```text
+airbattery-helper/main.swift
+```
+
+The installed application bundle itself does not need to be committed to the
+repository.
 
 ---
 
