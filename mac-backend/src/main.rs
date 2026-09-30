@@ -1138,6 +1138,12 @@ fn update_airbattery(battery_level: u8) {
         return;
     }
 
+    let device_id = std::env::var("FLIPPER_DEVICE_ID")
+        .unwrap_or_else(|_| "FlipperZero".to_string());
+
+    let device_name = std::env::var("FLIPPER_DEVICE_NAME")
+        .unwrap_or_else(|_| "Flipper Zero".to_string());
+
     let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(value) => value.as_secs_f64(),
         Err(_) => return,
@@ -1147,9 +1153,9 @@ fn update_airbattery(battery_level: u8) {
         concat!(
             "[{{",
             "\"hasBattery\":true,",
-            "\"deviceID\":\"54594526E180\",",
+            "\"deviceID\":\"{}\",",
             "\"deviceType\":\"general_bt\",",
-            "\"deviceName\":\"TYECzer0\",",
+            "\"deviceName\":\"{}\",",
             "\"deviceModel\":\"Flipper Zero\",",
             "\"batteryLevel\":{},",
             "\"isCharging\":0,",
@@ -1163,7 +1169,7 @@ fn update_airbattery(battery_level: u8) {
             "\"realUpdate\":{}",
             "}}]"
         ),
-        battery_level, now, now
+        device_id, device_name, battery_level, now, now
     );
 
     let tmp_path = "/tmp/flipper-airbattery.json";

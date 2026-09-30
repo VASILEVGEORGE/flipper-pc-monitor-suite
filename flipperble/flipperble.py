@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import os
 import argparse
 import asyncio
 import struct
@@ -11,7 +12,7 @@ from bleak import BleakScanner, BleakClient
 import flipper_pb2
 
 
-DEVICE_NAME = "TYECzer0"
+DEVICE_NAME = os.environ.get("FLIPPER_DEVICE_NAME", "Flipper Zero")
 
 TX_UUID = "19ed82ae-ed21-4c9d-4145-228e62fe0000"
 RX_UUID = "19ed82ae-ed21-4c9d-4145-228e61fe0000"

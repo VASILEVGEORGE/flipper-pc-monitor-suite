@@ -20,7 +20,7 @@ pub async fn get_central(manager: &Manager) -> Adapter {
 
 pub async fn get_flipper(central: &Adapter, id: &PeripheralId) -> Option<Peripheral> {
     let target_name =
-        std::env::var("FLIPPER_DEVICE_NAME").unwrap_or_else(|_| "TYECzer0".to_string());
+        std::env::var("FLIPPER_DEVICE_NAME").unwrap_or_else(|_| "Flipper Zero".to_string());
 
     for p in central
         .peripherals()

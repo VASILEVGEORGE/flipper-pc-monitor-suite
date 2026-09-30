@@ -441,9 +441,9 @@ The JSON contains an AirBattery-compatible logical device entry similar to:
 [
   {
     "hasBattery": true,
-    "deviceID": "54594526E180",
+    "deviceID": "YOUR_FLIPPER_DEVICE_ID",
     "deviceType": "general_bt",
-    "deviceName": "TYECzer0",
+    "deviceName": "Flipper Zero",
     "deviceModel": "Flipper Zero",
     "batteryLevel": 83,
     "isCharging": 0,
@@ -793,3 +793,27 @@ Potential backend improvements include:
 See the repository and component license files.
 
 Preserve the applicable license and attribution for vendored dependencies such as `macmon`.
+
+## Configuration
+
+The backend supports the following environment variables:
+
+```text
+FLIPPER_DEVICE_NAME
+FLIPPER_DEVICE_ID
+```
+
+Example:
+
+```bash
+export FLIPPER_DEVICE_NAME="My Flipper"
+export FLIPPER_DEVICE_ID="my-flipper-01"
+```
+
+`FLIPPER_DEVICE_NAME` is used for BLE device matching.
+
+`FLIPPER_DEVICE_ID` is used as the logical AirBattery device identifier.
+
+For persistent LaunchAgent configuration, define these values under
+`EnvironmentVariables` in the LaunchAgent plist instead of exporting them
+manually in a shell.

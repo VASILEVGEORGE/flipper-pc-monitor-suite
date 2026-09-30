@@ -176,9 +176,9 @@ Example shape:
 [
   {
     "hasBattery": true,
-    "deviceID": "54594526E180",
+    "deviceID": "YOUR_FLIPPER_DEVICE_ID",
     "deviceType": "general_bt",
-    "deviceName": "TYECzer0",
+    "deviceName": "Flipper Zero",
     "deviceModel": "Flipper Zero",
     "batteryLevel": 83,
     "isCharging": 0,
@@ -214,7 +214,7 @@ Bundle information used during development:
 
 ```text
 Name:       Flipper AirBattery Helper
-Bundle ID:  bg.optimistas.FlipperAirBatteryHelper
+Bundle ID:  io.github.vasilevgeorge.FlipperAirBatteryHelper
 Version:    1.0
 UI mode:    LSUIElement=true
 ```

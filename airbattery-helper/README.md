@@ -87,7 +87,7 @@ Development bundle metadata:
 ```text
 CFBundleDisplayName:        Flipper AirBattery Helper
 CFBundleExecutable:         FlipperAirBatteryHelper
-CFBundleIdentifier:         bg.optimistas.FlipperAirBatteryHelper
+CFBundleIdentifier:         io.github.vasilevgeorge.FlipperAirBatteryHelper
 CFBundleShortVersionString: 1.0
 CFBundleVersion:            1
 LSUIElement:                true
