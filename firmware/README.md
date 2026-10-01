@@ -1,164 +1,557 @@
-# Momentum Firmware Patch
+# Firmware Patches
 
-PC Monitor uses a small Momentum firmware patch to provide reliable BLE
-advertising state updates that the macOS backend can monitor before opening
-an RPC connection.
+This directory contains firmware-side patches used by the **flipper-pc-monitor-suite** project.
 
-## Modified Firmware Files
+The current FindMyFlipper patch adds dynamic battery reporting to the Apple Find My advertisement and a small CLI test interface for validating the advertised battery state at runtime.
 
-The patch modifies only these Momentum firmware files:
+---
 
-- `targets/f7/ble_glue/gap.c`
-- `targets/f7/furi_hal/furi_hal_bt.c`
+# FindMyFlipper Dynamic Battery Patch
 
-The PC Monitor FAP itself is not included in this patch. Its source is located
-separately in the `flipper-fap/` directory of this repository.
-
-## BLE Advertising Protocol
-
-PC Monitor uses manufacturer-specific BLE advertising data containing the
-following signature:
+File:
 
 ```text
-46 5A 01 BAT FLAGS
+findmyflipper-dynamic-battery.patch
 ```
 
-The fields are:
+Source commit:
 
-| Field | Size | Description |
+```text
+481d3cf4d findmy: add dynamic battery reporting and test CLI
+```
+
+The patch was created from a Momentum firmware tree based on:
+
+```text
+mntm-012
+```
+
+and developed against:
+
+```text
+Firmware API 87.1
+protobuf 0.25
+```
+
+The patch modifies:
+
+```text
+applications/system/findmy/findmy_startup.c
+applications/system/findmy/findmy_state.c
+applications/system/findmy/findmy_state.h
+```
+
+---
+
+## What the Patch Adds
+
+The patch adds:
+
+- dynamic Find My battery reporting;
+- a background battery refresh worker;
+- live Extra Beacon payload updates;
+- runtime battery test commands through the Flipper CLI;
+- no periodic beacon stop/start during battery refresh;
+- automatic restoration of the real battery category after a test override.
+
+---
+
+# Battery Reporting
+
+The Find My advertisement contains a battery-status byte in the Apple Offline Finding payload.
+
+The patch maps the real Flipper battery percentage to four Find My battery states:
+
+| Flipper battery | Find My byte | State |
 |---|---:|---|
-| `46 5A` | 2 bytes | PC Monitor manufacturer signature |
-| `01` | 1 byte | Advertising protocol version |
-| `BAT` | 1 byte | Flipper battery percentage |
-| `FLAGS` | 1 byte | PC Monitor / RPC request state |
+| 81-100% | `0x00` | Full |
+| 51-80% | `0x50` | Medium |
+| 21-50% | `0xA0` | Low |
+| 0-20% | `0xF0` | Critical |
 
-The macOS backend watches this advertising payload and can determine the
-Flipper battery level and whether PC Monitor is requesting an RPC connection.
-
-## Changes to `gap.c`
-
-The patch adds an additional protocol-version check when updating the battery
-value in the manufacturer-specific advertising payload.
-
-The payload must match:
+The relevant constants are:
 
 ```c
-gap->service.mfg_data[4] == 0x46 &&
-gap->service.mfg_data[5] == 0x5A &&
-gap->service.mfg_data[6] == 0x01
+#define BATTERY_FULL     0x00
+#define BATTERY_MEDIUM   0x50
+#define BATTERY_LOW      0xA0
+#define BATTERY_CRITICAL 0xF0
 ```
 
-This makes the battery update specific to PC Monitor advertising protocol
-version `0x01` and prevents unrelated manufacturer payloads beginning with
-`46 5A` from being modified.
+---
 
-## Changes to `furi_hal_bt.c`
+# Example Find My Advertisement
 
-The implementation of:
-
-```c
-furi_hal_bt_update_advertising_flags(uint8_t flags)
-```
-
-was hardened to make advertising updates safer.
-
-The modified function:
-
-1. Always updates the cached manufacturer payload first.
-2. Checks whether the Bluetooth stack is active.
-3. Does not attempt an HCI advertising restart when Bluetooth is inactive.
-4. Remembers the last flags value.
-5. Does not restart advertising when the requested flags value has not changed.
-6. Restarts advertising only when GAP is currently in:
-   - `GapStateAdvFast`
-   - `GapStateAdvLowPower`
-7. Uses the normal GAP stop/start lifecycle rather than directly manipulating
-   the raw HCI scan-response data.
-
-This avoids unnecessary advertising interruptions and reduces the chance of
-disturbing an RPC connection while PC Monitor is starting, stopping or
-reconnecting.
-
-## Patch File
-
-The patch is stored at:
+A captured Apple Find My advertisement can look like:
 
 ```text
-firmware/patches/momentum-mntm-012-pc-monitor.patch
+4C00121900CB60BFE2325E9A423BEF5BC4F13E393EB77704AD2D7B036E
 ```
 
-## Applying the Patch
+The battery byte is:
 
-Clone or enter a compatible Momentum Firmware source tree.
+```text
+4C 00 12 19 00 ...
+            ^^
+```
 
-First verify that the patch applies cleanly:
+For example:
+
+```text
+00 = Full
+50 = Medium
+A0 = Low
+F0 = Critical
+```
+
+A live test may therefore show:
+
+```text
+before:
+4C00121900CB60...
+
+after:
+4C00121950CB60...
+```
+
+Only the battery-status byte changes.
+
+---
+
+# Background Battery Worker
+
+The startup component starts a background worker named:
+
+```text
+FindMyBattery
+```
+
+The worker checks the battery periodically.
+
+Current interval:
+
+```c
+#define FINDMY_BATTERY_REFRESH_MS (60 * 1000)
+```
+
+That is:
+
+```text
+60 seconds
+```
+
+The worker:
+
+1. checks that BLE/GATT support is available;
+2. loads the persisted FindMy state;
+3. confirms that the beacon is configured as active;
+4. recalculates the battery category;
+5. updates the live advertisement only when required.
+
+---
+
+# Live Advertisement Update
+
+The patch updates the active Extra Beacon through:
+
+```c
+furi_hal_bt_extra_beacon_set_data(...)
+```
+
+without restarting the beacon.
+
+The underlying Momentum implementation calls:
+
+```c
+gap_extra_beacon_set_data(...)
+```
+
+which ultimately calls:
+
+```c
+aci_gap_additional_beacon_set_data(...)
+```
+
+This means the advertising payload can be updated while the Extra Beacon is running.
+
+No periodic:
+
+```text
+stop
+set data
+start
+```
+
+cycle is required for battery refresh.
+
+---
+
+# Battery Refresh Function
+
+The patch adds:
+
+```c
+bool findmy_state_refresh_battery(FindMyState* state);
+```
+
+The function:
+
+- supports Apple Find My tags;
+- requires the persisted beacon to be active;
+- requires the Extra Beacon to currently be active;
+- calculates the battery category from the real Flipper battery;
+- updates only the advertising payload;
+- returns `true` when the advertised battery category was changed.
+
+---
+
+# Runtime CLI Test Command
+
+The patch registers:
+
+```text
+findmy_battery
+```
+
+in the Flipper CLI.
+
+Show it with:
+
+```text
+help
+```
+
+Expected entry:
+
+```text
+findmy_battery
+```
+
+---
+
+## Show Current Advertised Battery
+
+```text
+findmy_battery show
+```
+
+Example:
+
+```text
+Current FindMy battery byte: 0x00
+```
+
+---
+
+## Force Full
+
+```text
+findmy_battery 00
+```
+
+Expected result:
+
+```text
+FindMy battery byte set to 0x00
+```
+
+---
+
+## Force Medium
+
+```text
+findmy_battery 50
+```
+
+Expected result:
+
+```text
+FindMy battery byte set to 0x50
+```
+
+---
+
+## Force Low
+
+```text
+findmy_battery A0
+```
+
+Lowercase is also accepted:
+
+```text
+findmy_battery a0
+```
+
+---
+
+## Force Critical
+
+```text
+findmy_battery F0
+```
+
+Lowercase is also accepted:
+
+```text
+findmy_battery f0
+```
+
+---
+
+## Return to Automatic Battery Reporting
+
+```text
+findmy_battery auto
+```
+
+This reloads the normal FindMy state and recalculates the battery category from the real Flipper battery.
+
+Example:
+
+```text
+FindMy battery returned to automatic mode: 0x00
+```
+
+---
+
+# Validating the Patch
+
+A convenient validation setup is the Marauder Find My monitor included in `flipperble`.
+
+Start:
 
 ```bash
-git apply --check /path/to/momentum-mntm-012-pc-monitor.patch
+flipperble --device ZER0TYEC marauder-findmy
 ```
 
-If no errors are displayed, apply it:
+Example initial output:
+
+```text
+15:42:26.560  DE:43:F3:5E:0A:2B   -69 dBm  len=31  4C00121900CB60...
+```
+
+Then from the Flipper CLI:
+
+```text
+findmy_battery 50
+```
+
+Run or continue the monitor.
+
+Expected result:
+
+```text
+15:43:56.239  DE:43:F3:5E:0A:2B   -64 dBm  len=31  4C00121950CB60...
+```
+
+This confirms that the Extra Beacon payload was updated live.
+
+If the real Flipper battery is above 80%, the background worker should later restore:
+
+```text
+0x50 -> 0x00
+```
+
+without rebooting the Flipper and without manually reopening FindMy.
+
+---
+
+# FindMy State Storage
+
+The active FindMy configuration is stored on the Flipper SD card at:
+
+```text
+/ext/apps_data/findmy/findmy_state.txt
+```
+
+This path comes from:
+
+```c
+#define FINDMY_STATE_DIR  EXT_PATH("apps_data/findmy")
+#define FINDMY_STATE_PATH FINDMY_STATE_DIR "/findmy_state.txt"
+```
+
+The specific Find My payload is runtime state and is not hardcoded in the firmware source.
+
+You can inspect the state with:
 
 ```bash
-git apply /path/to/momentum-mntm-012-pc-monitor.patch
+flipperble \
+  --device ZER0TYEC \
+  cat /ext/apps_data/findmy/findmy_state.txt
 ```
 
-Then verify the modifications:
+---
+
+# Applying the Patch
+
+From the Momentum firmware source root:
 
 ```bash
-git diff --stat
-git diff -- targets/f7/ble_glue/gap.c
-git diff -- targets/f7/furi_hal/furi_hal_bt.c
+git apply /path/to/findmyflipper-dynamic-battery.patch
 ```
 
-Build Momentum normally:
+Alternatively:
+
+```bash
+patch -p1 < /path/to/findmyflipper-dynamic-battery.patch
+```
+
+Verify:
+
+```bash
+git diff -- \
+  applications/system/findmy/findmy_startup.c \
+  applications/system/findmy/findmy_state.c \
+  applications/system/findmy/findmy_state.h
+```
+
+---
+
+# Building
+
+From the Momentum firmware root:
 
 ```bash
 ./fbt
 ```
 
-## Reverting the Patch
-
-If the patched files have not been committed, restore the original Momentum
-versions with:
+If the build succeeds, flash through USB:
 
 ```bash
-git restore targets/f7/ble_glue/gap.c
-git restore targets/f7/furi_hal/furi_hal_bt.c
+./fbt flash_usb_full
 ```
 
-## Compatibility
+The exact USB device may reconnect during flashing.
 
-The patch was developed against Momentum Firmware `mntm-012`.
-
-Because the Momentum Bluetooth and GAP implementation may change between
-firmware releases, always run:
+If needed, check:
 
 ```bash
-git apply --check firmware/patches/momentum-mntm-012-pc-monitor.patch
+ls -l /dev/cu.usbmodem*
 ```
 
-before applying the patch to another Momentum revision.
+---
 
-A failure from `git apply --check` on a newer release does not necessarily mean
-that PC Monitor is incompatible. It means that the patch needs to be reviewed
-against the newer implementation before being applied.
+# CLI API Compatibility
 
-## PC Monitor Components
+The current Momentum branch uses the newer CLI registry API.
 
-The complete project consists of three main userspace components plus this
-firmware modification:
+The patch therefore uses:
+
+```c
+CliRegistry*
+```
+
+and:
+
+```c
+cli_registry_add_command(...)
+```
+
+instead of the older:
+
+```c
+Cli*
+cli_add_command(...)
+```
+
+The callback uses:
+
+```c
+PipeSide* pipe
+```
+
+This is important when porting the patch to another Momentum or upstream firmware revision.
+
+---
+
+# Known Runtime Behavior
+
+## Flipper Locked
+
+Interactive RPC may time out while the Flipper itself is locked.
+
+Observed:
 
 ```text
-flipper-pc-monitor-suite/
-├── flipper-fap/       PC Monitor application for Flipper Zero
-├── mac-backend/       macOS telemetry and BLE/RPC backend
-├── flipperble/        macOS BLE RPC command-line client
-└── firmware/
-    ├── README.md
-    └── patches/
-        └── momentum-mntm-012-pc-monitor.patch
+unlocked -> RPC works
+locked   -> RPC timeout
+unlocked -> RPC works again
 ```
 
-The firmware patch provides the BLE advertising behavior used by the higher
-level PC Monitor components.
+This does not necessarily stop the Find My Extra Beacon.
+
+The beacon can continue advertising while interactive RPC is unavailable.
+
+---
+
+# Reverting the Patch
+
+If the patch was applied with Git and has not been committed:
+
+```bash
+git restore \
+  applications/system/findmy/findmy_startup.c \
+  applications/system/findmy/findmy_state.c \
+  applications/system/findmy/findmy_state.h
+```
+
+If it was committed, revert the commit instead:
+
+```bash
+git revert 481d3cf4d
+```
+
+Or reset/cherry-pick as appropriate for your branch workflow.
+
+---
+
+# Exporting the Patch Again
+
+To regenerate the patch from the original commit:
+
+```bash
+git format-patch -1 481d3cf4d --stdout > \
+findmyflipper-dynamic-battery.patch
+```
+
+---
+
+# Related Project Components
+
+The repository also contains:
+
+```text
+flipperble/
+    Host-side Flipper BLE/USB RPC CLI
+
+marauder-rpc-bridge/
+    Flipper RPC <-> UART bridge for ESP32 Marauder
+
+mac-backend/
+    Shared macOS BLE RPC backend
+
+flipper-fap/
+    PC Monitor Flipper application
+```
+
+The FindMy battery patch is firmware-side functionality and can be used independently, but `flipperble marauder-findmy` is useful for validating the resulting Apple Find My advertisement.
+
+---
+
+# Notes
+
+The test CLI changes only the currently advertised battery byte.
+
+It is intended for development and verification.
+
+The normal background worker always derives the automatic value from the real Flipper battery level.
+
+---
+
+# License
+
+This patch modifies code from the Momentum firmware project.
+
+Refer to the Momentum and upstream Flipper Zero repositories for the licenses that apply to the original firmware source. Repository-specific additions remain subject to the license terms included with this project.
