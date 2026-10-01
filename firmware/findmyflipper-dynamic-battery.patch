@@ -1,0 +1,319 @@
+From 481d3cf4d2bda10bddac1c0540bc9c58fa49745d Mon Sep 17 00:00:00 2001
+From: Georgi Vasilev <120402434+VASILEVGEORGE@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 16:12:51 +0300
+Subject: [PATCH] findmy: add dynamic battery reporting and test CLI
+
+---
+ applications/system/findmy/findmy_startup.c | 172 ++++++++++++++++++++
+ applications/system/findmy/findmy_state.c   |  76 +++++++++
+ applications/system/findmy/findmy_state.h   |  14 ++
+ 3 files changed, 262 insertions(+)
+
+diff --git a/applications/system/findmy/findmy_startup.c b/applications/system/findmy/findmy_startup.c
+index b8344671d..c691e066d 100644
+--- a/applications/system/findmy/findmy_startup.c
++++ b/applications/system/findmy/findmy_startup.c
+@@ -1,4 +1,7 @@
+ #include "findmy_state.h"
++#include <furi.h>
++#include <cli/cli.h>
++#include <toolbox/pipe.h>
+ #include <furi_hal.h>
+ #include <bt/bt_service/bt.h>
+ #include <storage/storage.h>
+@@ -6,6 +9,169 @@
+ 
+ #define TAG "FindMyStartup"
+ 
++#define FINDMY_BATTERY_REFRESH_MS (60 * 1000)
++
++static FuriThread* findmy_battery_thread = NULL;
++
++static int32_t findmy_battery_worker(void* context) {
++    UNUSED(context);
++
++    FURI_LOG_I(TAG, "Battery refresh worker started");
++
++    while(true) {
++        furi_delay_ms(FINDMY_BATTERY_REFRESH_MS);
++
++        // Core2 / BLE must still be available.
++        if(!furi_hal_bt_is_gatt_gap_supported()) {
++            continue;
++        }
++
++        FindMyState state;
++
++        // findmy_state_load() returns true only when the
++        // persisted beacon is configured as active.
++        if(!findmy_state_load(&state)) {
++            continue;
++        }
++
++        if(findmy_state_refresh_battery(&state)) {
++            FURI_LOG_I(
++                TAG,
++                "Find My battery advertisement updated: 0x%02X",
++                state.data[6]);
++        }
++    }
++
++    return 0;
++}
++
++
++static void findmy_battery_cli_callback(
++    PipeSide* pipe,
++    FuriString* args,
++    void* context) {
++
++    UNUSED(pipe);
++    UNUSED(context);
++
++    furi_string_trim(args);
++
++    const char* value = furi_string_get_cstr(args);
++
++    if(strcmp(value, "show") == 0) {
++        uint8_t level = findmy_state_get_advertised_battery();
++
++        if(level == 0xFF) {
++            printf("FindMy Extra Beacon is not active\r\n");
++            return;
++        }
++
++        printf(
++            "Current FindMy battery byte: 0x%02X\r\n",
++            level);
++
++        return;
++    }
++
++    if(strcmp(value, "auto") == 0) {
++        FindMyState state;
++
++        if(!findmy_state_load(&state)) {
++            printf("FindMy beacon is not active\r\n");
++            return;
++        }
++
++        /*
++         * Re-apply the normal FindMy payload calculation.
++         * This computes the battery category from the real
++         * Flipper battery and updates the active Extra Beacon.
++         */
++        findmy_state_apply(&state);
++
++        printf(
++            "FindMy battery returned to automatic mode: 0x%02X\r\n",
++            findmy_state_get_advertised_battery());
++
++        return;
++    }
++
++    uint8_t battery_level;
++
++    if(strcmp(value, "00") == 0) {
++        battery_level = BATTERY_FULL;
++    } else if(strcmp(value, "50") == 0) {
++        battery_level = BATTERY_MEDIUM;
++    } else if(
++        strcmp(value, "A0") == 0 ||
++        strcmp(value, "a0") == 0) {
++
++        battery_level = BATTERY_LOW;
++
++    } else if(
++        strcmp(value, "F0") == 0 ||
++        strcmp(value, "f0") == 0) {
++
++        battery_level = BATTERY_CRITICAL;
++
++    } else {
++        printf(
++            "Usage: findmy_battery <show|auto|00|50|A0|F0>\r\n"
++            "  show = current advertised battery byte\r\n"
++            "  auto = restore real battery category\r\n"
++            "  00   = Full\r\n"
++            "  50   = Medium\r\n"
++            "  A0   = Low\r\n"
++            "  F0   = Critical\r\n");
++
++        return;
++    }
++
++    if(!findmy_state_set_battery_test(battery_level)) {
++        printf(
++            "Failed to update FindMy Extra Beacon\r\n");
++        return;
++    }
++
++    printf(
++        "FindMy battery byte set to 0x%02X\r\n",
++        battery_level);
++}
++
++static void findmy_register_cli(void) {
++#ifdef SRV_CLI
++    CliRegistry* registry = furi_record_open(RECORD_CLI);
++
++    cli_registry_add_command(
++        registry,
++        "findmy_battery",
++        CliCommandFlagDefault,
++        findmy_battery_cli_callback,
++        NULL);
++
++    furi_record_close(RECORD_CLI);
++
++    FURI_LOG_I(
++        TAG,
++        "Registered findmy_battery CLI command");
++#else
++    UNUSED(findmy_battery_cli_callback);
++#endif
++}
++
++static void findmy_start_battery_worker(void) {
++    if(findmy_battery_thread) {
++        return;
++    }
++
++    findmy_battery_thread = furi_thread_alloc_ex(
++        "FindMyBattery",
++        2048,
++        findmy_battery_worker,
++        NULL);
++
++    furi_thread_start(findmy_battery_thread);
++}
++
+ static int32_t findmy_startup_apply(void* context) {
+     UNUSED(context);
+     FURI_LOG_D(TAG, "Loading state");
+@@ -48,4 +214,10 @@ void findmy_startup() {
+     }
+ 
+     furi_record_close(RECORD_STORAGE);
++
++    // Keep the Apple Find My battery state synchronized.
++    findmy_start_battery_worker();
++
++    // Runtime Find My battery testing command.
++    findmy_register_cli();
+ }
+diff --git a/applications/system/findmy/findmy_state.c b/applications/system/findmy/findmy_state.c
+index 047eb0b83..f5222c045 100644
+--- a/applications/system/findmy/findmy_state.c
++++ b/applications/system/findmy/findmy_state.c
+@@ -112,6 +112,82 @@ static void findmy_state_update_payload_battery(FindMyState* state) {
+     }
+ }
+ 
++bool findmy_state_refresh_battery(FindMyState* state) {
++    static uint8_t last_advertised_battery = 0xFF;
++
++    if(!state) return false;
++
++    // Battery status field is defined only for Apple Find My.
++    if(state->tag_type != FindMyTypeApple) return false;
++
++    if(!state->beacon_active) return false;
++    if(!furi_hal_bt_extra_beacon_is_active()) return false;
++
++    // Calculate current battery category from the real Flipper battery.
++    findmy_state_update_payload_battery(state);
++
++    const uint8_t new_battery_level = state->data[6];
++
++    // First execution after boot: the startup apply() has already
++    // programmed this value into the beacon. Remember it without
++    // touching the controller again.
++    if(last_advertised_battery == 0xFF) {
++        last_advertised_battery = new_battery_level;
++        return false;
++    }
++
++    // Nothing changed: don't touch BLE.
++    if(last_advertised_battery == new_battery_level) {
++        return false;
++    }
++
++    // Update only advertisement data. No stop/start and no
++    // advertising configuration reset.
++    furi_check(
++        furi_hal_bt_extra_beacon_set_data(
++            state->data,
++            findmy_state_data_size(state->tag_type)));
++
++    last_advertised_battery = new_battery_level;
++
++    return true;
++}
++
++
++bool findmy_state_set_battery_test(uint8_t battery_level) {
++    uint8_t data[EXTRA_BEACON_MAX_DATA_SIZE] = {0};
++
++    if(!furi_hal_bt_extra_beacon_is_active()) {
++        return false;
++    }
++
++    uint8_t len = furi_hal_bt_extra_beacon_get_data(data);
++
++    if(len <= 6) {
++        return false;
++    }
++
++    data[6] = battery_level;
++
++    return furi_hal_bt_extra_beacon_set_data(data, len);
++}
++
++uint8_t findmy_state_get_advertised_battery(void) {
++    uint8_t data[EXTRA_BEACON_MAX_DATA_SIZE] = {0};
++
++    if(!furi_hal_bt_extra_beacon_is_active()) {
++        return 0xFF;
++    }
++
++    uint8_t len = furi_hal_bt_extra_beacon_get_data(data);
++
++    if(len <= 6) {
++        return 0xFF;
++    }
++
++    return data[6];
++}
++
+ void findmy_state_apply(FindMyState* state) {
+     // This function applies configured state to the beacon (loaded values)
+ 
+diff --git a/applications/system/findmy/findmy_state.h b/applications/system/findmy/findmy_state.h
+index f0be35430..e47a6a972 100644
+--- a/applications/system/findmy/findmy_state.h
++++ b/applications/system/findmy/findmy_state.h
+@@ -32,6 +32,20 @@ bool findmy_state_load(FindMyState* out_state);
+ 
+ void findmy_state_apply(FindMyState* state);
+ 
++/**
++ * Refresh the Apple Find My battery status in the active
++ * Extra Beacon payload.
++ *
++ * Returns true only when the advertised battery category
++ * actually changed.
++ *
++ * Does NOT stop/restart the beacon.
++ */
++bool findmy_state_refresh_battery(FindMyState* state);
++
++bool findmy_state_set_battery_test(uint8_t battery_level);
++uint8_t findmy_state_get_advertised_battery(void);
++
+ void findmy_state_save_and_apply(FindMyState* state);
+ 
+ uint8_t findmy_state_data_size(FindMyType type);
+-- 
+2.52.0
+
