@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-import os
 
 import argparse
+import os
 import asyncio
 import struct
 import sys
+
+try:
+    import serial
+except ImportError:
+    serial = None
 from pathlib import Path
 
 from bleak import BleakScanner, BleakClient
@@ -67,11 +72,17 @@ def next_command_id(value):
 
 class FlipperBLE:
 
-    def __init__(self, name):
+    def __init__(self, name, usb_port=None):
         self.name = name
+        self.usb_port = usb_port
 
         self.device = None
         self.client = None
+
+        self.usb_mode = False
+        self.usb_serial = None
+        self.usb_loop = None
+        self.usb_reader_registered = False
 
         self.rx_buffer = bytearray()
 
@@ -87,40 +98,159 @@ class FlipperBLE:
         self.proxy_reader = None
         self.proxy_writer = None
 
+        # Unsolicited App.DataExchange packets sent by an
+        # RPC-mode FAP, e.g. Marauder UART -> BLE RPC.
+        self.app_data_queue = asyncio.Queue()
+
+
+
+    def _usb_read_ready(self):
+
+        if (
+            not self.usb_mode
+            or self.usb_serial is None
+        ):
+            return
+
+        try:
+            waiting = self.usb_serial.in_waiting
+
+            if waiting <= 0:
+                waiting = 1
+
+            data = self.usb_serial.read(waiting)
+
+            if data:
+                # USB RPC uses the same varint + protobuf
+                # framing as the BLE RPC transport.
+                self.notification_handler(
+                    None,
+                    data
+                )
+
+        except Exception as e:
+            print(
+                f"USB RPC read error: {e}",
+                file=sys.stderr
+            )
+
+
+    async def _connect_usb(self):
+
+        if serial is None:
+            raise RuntimeError(
+                "USB mode requires pyserial. "
+                "Install it in the flipperble virtualenv."
+            )
+
+        try:
+            self.usb_serial = serial.Serial(
+                port=self.usb_port,
+                baudrate=230400,
+                timeout=0,
+                write_timeout=2
+            )
+
+        except Exception as e:
+            raise RuntimeError(
+                f"Could not open USB port "
+                f"{self.usb_port}: {e}"
+            )
+
+        # Start from a known CLI state.
+        try:
+            self.usb_serial.reset_input_buffer()
+            self.usb_serial.reset_output_buffer()
+        except Exception:
+            pass
+
+        # Wake the Flipper CLI.
+        self.usb_serial.write(b"\r\n")
+        self.usb_serial.flush()
+
+        await asyncio.sleep(0.20)
+
+        # Throw away CLI banner/prompt output.
+        try:
+            waiting = self.usb_serial.in_waiting
+            if waiting:
+                self.usb_serial.read(waiting)
+        except Exception:
+            pass
+
+        # Firmware CLI command switches the CDC channel
+        # from text CLI mode to protobuf RPC mode.
+        self.usb_serial.write(
+            b"start_rpc_session\r"
+        )
+        self.usb_serial.flush()
+
+        await asyncio.sleep(0.25)
+
+        # No RPC command has been sent yet, so anything
+        # currently waiting is CLI transition text.
+        try:
+            waiting = self.usb_serial.in_waiting
+            if waiting:
+                self.usb_serial.read(waiting)
+        except Exception:
+            pass
+
+        self.usb_mode = True
+        self.usb_loop = asyncio.get_running_loop()
+
+        try:
+            self.usb_loop.add_reader(
+                self.usb_serial.fileno(),
+                self._usb_read_ready
+            )
+            self.usb_reader_registered = True
+
+        except Exception as e:
+            self.usb_serial.close()
+            self.usb_serial = None
+            self.usb_mode = False
+
+            raise RuntimeError(
+                f"Could not register USB RPC reader: {e}"
+            )
+
+        print(
+            f"USB RPC connected: {self.usb_port}"
+        )
+
 
     async def advertised_battery(
         self,
-        timeout_seconds=5
+        timeout_seconds=15
     ):
+        """
+        Continuously scan for the custom Momentum battery
+        manufacturer advertisement.
 
-        #
-        # Custom Momentum firmware advertisement:
-        #
-        # Manufacturer ID: 0xFFFF
-        #
-        # CoreBluetooth/Bleak exposes the manufacturer ID
-        # separately, so the value here is:
-        #
-        #   46 5A 01 XX FLAGS
-        #   F  Z  ver battery
-        #
-        devices = await BleakScanner.discover(
-            timeout=timeout_seconds,
-            return_adv=True
-        )
+        Manufacturer ID: 0xFFFF
 
-        for _, item in devices.items():
+        Payload:
+            46 5A 01 XX FLAGS
+            F  Z  ver battery
 
-            device, advertisement = item
+        A persistent scanner is substantially more reliable than
+        repeatedly calling BleakScanner.discover(), because macOS
+        CoreBluetooth does not need to tear down and restart the
+        scan between attempts.
+        """
 
-            name = (
-                device.name
-                or advertisement.local_name
-                or ""
-            )
+        loop = asyncio.get_running_loop()
 
-            if name != self.name:
-                continue
+        found = loop.create_future()
+
+        def detection_callback(
+            device,
+            advertisement
+        ):
+
+            if found.done():
+                return
 
             data = (
                 advertisement
@@ -129,7 +259,7 @@ class FlipperBLE:
             )
 
             if not data:
-                continue
+                return
 
             if (
                 len(data) >= 5
@@ -139,12 +269,41 @@ class FlipperBLE:
                 level = int(data[3])
 
                 if 0 <= level <= 100:
-                    return level
+                    found.set_result(level)
 
-        return None
+        scanner = BleakScanner(
+            detection_callback
+        )
+
+        try:
+            await scanner.start()
+
+            try:
+                level = await asyncio.wait_for(
+                    found,
+                    timeout=timeout_seconds
+                )
+
+                return level
+
+            except asyncio.TimeoutError:
+                return None
+
+        finally:
+            try:
+                await scanner.stop()
+            except Exception:
+                pass
 
 
     async def connect(self):
+
+        #
+        # Explicit USB RPC mode.
+        #
+        if self.usb_port:
+            await self._connect_usb()
+            return
 
         #
         # Preferred mode:
@@ -213,6 +372,30 @@ class FlipperBLE:
 
     async def disconnect(self):
 
+        if self.usb_serial is not None:
+
+            if (
+                self.usb_reader_registered
+                and self.usb_loop is not None
+            ):
+                try:
+                    self.usb_loop.remove_reader(
+                        self.usb_serial.fileno()
+                    )
+                except Exception:
+                    pass
+
+            self.usb_reader_registered = False
+
+            try:
+                self.usb_serial.close()
+            except Exception:
+                pass
+
+            self.usb_serial = None
+            self.usb_mode = False
+            self.usb_loop = None
+
         if self.proxy_writer is not None:
 
             self.proxy_writer.close()
@@ -232,7 +415,7 @@ class FlipperBLE:
 
     async def start_rpc(self):
 
-        if self.proxy_mode:
+        if self.proxy_mode or self.usb_mode:
             return
 
         await self.client.start_notify(
@@ -334,6 +517,23 @@ class FlipperBLE:
                     file=sys.stderr
                 )
                 continue
+
+            # FAP -> host arbitrary RPC data uses the same
+            # app_data_exchange_request protobuf field.
+            #
+            # These packets may use a command_id unrelated to the
+            # currently outstanding host request, so process them
+            # before the normal command_id filter.
+            if msg.HasField("app_data_exchange_request"):
+                data = bytes(
+                    msg.app_data_exchange_request.data
+                )
+
+                if data:
+                    try:
+                        self.app_data_queue.put_nowait(data)
+                    except Exception:
+                        pass
 
             if msg.command_id != self.command_id:
                 continue
@@ -494,6 +694,23 @@ class FlipperBLE:
                 )
             )
 
+        elif self.usb_mode:
+
+            await self.send_packet(packet)
+
+            try:
+                await asyncio.wait_for(
+                    self.finished.wait(),
+                    timeout=timeout
+                )
+
+            except asyncio.TimeoutError:
+                raise RuntimeError(
+                    "Timeout waiting for Flipper USB RPC response"
+                )
+
+            result = self.frames
+
         else:
 
             await self.client.write_gatt_char(
@@ -522,6 +739,24 @@ class FlipperBLE:
 
 
     async def send_packet(self, packet):
+
+        if self.usb_mode:
+
+            if self.usb_serial is None:
+                raise RuntimeError(
+                    "USB RPC port is not open"
+                )
+
+            try:
+                self.usb_serial.write(packet)
+                self.usb_serial.flush()
+
+            except Exception as e:
+                raise RuntimeError(
+                    f"USB RPC write failed: {e}"
+                )
+
+            return
 
         if self.proxy_mode:
 
@@ -1291,6 +1526,335 @@ async def cmd_ls(flipper, path):
     print()
 
 
+async def cmd_marauder_start(flipper):
+
+    msg = flipper_pb2.Main()
+
+    req = msg.app_start_request
+    req.name = "/ext/apps/GPIO/marauder_rpc_bridge.fap"
+    req.args = "RPC"
+
+    frames = await flipper.request(
+        msg,
+        timeout=15
+    )
+
+    for frame in frames:
+        if frame.command_status != 0:
+            raise RuntimeError(
+                "Marauder bridge start RPC error "
+                f"{frame.command_status}"
+            )
+
+    print("Marauder RPC bridge started")
+    await asyncio.sleep(1)
+
+
+async def cmd_marauder_send(flipper, command):
+
+    if not command.endswith("\n"):
+        command += "\n"
+
+    # Flush stale UART output from earlier commands.
+    while True:
+        try:
+            flipper.app_data_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+
+    msg = flipper_pb2.Main()
+
+    req = msg.app_data_exchange_request
+    req.data = command.encode("utf-8")
+
+    frames = await flipper.request(
+        msg,
+        timeout=10
+    )
+
+    for frame in frames:
+        if frame.command_status != 0:
+            raise RuntimeError(
+                "Marauder DataExchange RPC error "
+                f"{frame.command_status}"
+            )
+
+    #
+    # rpc_system_app_exchange_data() produces unsolicited
+    # app_data_exchange_request packets. Collect output until
+    # Marauder becomes quiet for a short period.
+    #
+    output = bytearray()
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 3.0
+
+    while loop.time() < deadline:
+
+        remaining = deadline - loop.time()
+
+        try:
+            chunk = await asyncio.wait_for(
+                flipper.app_data_queue.get(),
+                timeout=min(0.50, remaining)
+            )
+
+        except asyncio.TimeoutError:
+            if output:
+                break
+            continue
+
+        output.extend(chunk)
+
+        # Each new UART chunk extends the quiet window slightly.
+        deadline = min(
+            loop.time() + 0.75,
+            loop.time() + 3.0
+        )
+
+    if output:
+        print(
+            output.decode(
+                "utf-8",
+                errors="replace"
+            ),
+            end=""
+        )
+    else:
+        print(
+            "[no UART response received]"
+        )
+
+    return bytes(output)
+
+
+async def cmd_marauder(flipper, command):
+
+    await cmd_marauder_start(flipper)
+
+    print(f"Marauder > {command}")
+
+    return await cmd_marauder_send(
+        flipper,
+        command
+    )
+
+
+async def cmd_marauder_send_raw(flipper, command):
+
+    if not command.endswith("\n"):
+        command += "\n"
+
+    msg = flipper_pb2.Main()
+
+    req = msg.app_data_exchange_request
+    req.data = command.encode("utf-8")
+
+    frames = await flipper.request(
+        msg,
+        timeout=10
+    )
+
+    for frame in frames:
+        if frame.command_status != 0:
+            raise RuntimeError(
+                "Marauder DataExchange RPC error "
+                f"{frame.command_status}"
+            )
+
+
+async def marauder_terminal_reader(flipper):
+
+    while True:
+
+        data = await flipper.app_data_queue.get()
+
+        if not data:
+            continue
+
+        print(
+            data.decode(
+                "utf-8",
+                errors="replace"
+            ),
+            end="",
+            flush=True
+        )
+
+
+async def cmd_marauder_terminal(flipper):
+
+    await cmd_marauder_start(flipper)
+
+    print()
+    print("Marauder interactive terminal")
+    print("BLE RPC <-> Flipper <-> UART <-> Apex 5")
+    print("Type 'exit' to quit.")
+    print()
+
+    reader_task = asyncio.create_task(
+        marauder_terminal_reader(flipper)
+    )
+
+    try:
+
+        while True:
+
+            try:
+                command = await asyncio.to_thread(
+                    input,
+                    "marauder> "
+                )
+
+            except EOFError:
+                break
+
+            command = command.strip()
+
+            if not command:
+                continue
+
+            if command.lower() in (
+                "exit",
+                "quit"
+            ):
+                break
+
+            await cmd_marauder_send_raw(
+                flipper,
+                command
+            )
+
+            # Let asynchronous UART output begin printing
+            # before displaying the next prompt.
+            await asyncio.sleep(0.15)
+
+    except KeyboardInterrupt:
+        print()
+
+    finally:
+
+        reader_task.cancel()
+
+        try:
+            await reader_task
+        except asyncio.CancelledError:
+            pass
+
+        print("Marauder terminal closed.")
+
+
+async def cmd_marauder_findmy(flipper):
+
+    import re
+    from datetime import datetime
+
+    await cmd_marauder_start(flipper)
+
+    # Flush anything left in the RPC application-data queue.
+    while True:
+        try:
+            flipper.app_data_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+
+    print()
+    print("Find My BLE monitor")
+    print("Filtering Apple Offline Finding advertisements: 4C001219")
+    print("Press Ctrl+C to stop.")
+    print()
+
+    # Start generic BLE scan on Marauder.
+    await cmd_marauder_send_raw(
+        flipper,
+        "sniffbt"
+    )
+
+    buffer = ""
+
+    # Example:
+    # BLEADV mac=de:43:f3:5e:0a:2b rssi=-67 len=31
+    # data=1EFF4C00121920...
+    pattern = re.compile(
+        r'BLEADV\s+'
+        r'mac=([0-9a-fA-F:]{17})\s+'
+        r'rssi=(-?\d+)\s+'
+        r'len=(\d+)\s+'
+        r'data=([0-9a-fA-F]+)'
+    )
+
+    try:
+
+        while True:
+
+            data = await flipper.app_data_queue.get()
+
+            if not data:
+                continue
+
+            buffer += data.decode(
+                "utf-8",
+                errors="replace"
+            )
+
+            # UART/RPC chunks do not necessarily align to lines.
+            while "\n" in buffer:
+
+                line, buffer = buffer.split("\n", 1)
+
+                match = pattern.search(line)
+
+                if not match:
+                    continue
+
+                mac = match.group(1).upper()
+                rssi = int(match.group(2))
+                length = int(match.group(3))
+                raw = match.group(4).upper()
+
+                # Apple Manufacturer Specific Data:
+                # FF 4C 00 12 19 ...
+                if "FF4C001219" not in raw:
+                    continue
+
+                pos = raw.find("FF4C001219")
+
+                apple = raw[pos + 2:]
+
+                timestamp = datetime.now().strftime(
+                    "%H:%M:%S.%f"
+                )[:-3]
+
+                print(
+                    f"{timestamp}  "
+                    f"{mac}  "
+                    f"{rssi:4d} dBm  "
+                    f"len={length:2d}  "
+                    f"{apple}",
+                    flush=True
+                )
+
+    except asyncio.CancelledError:
+        raise
+
+    finally:
+
+        print()
+        print("Stopping Marauder BLE scan...")
+
+        try:
+            await cmd_marauder_send_raw(
+                flipper,
+                "stopscan"
+            )
+        except Exception as exc:
+            print(
+                f"Warning: stopscan failed: {exc}"
+            )
+
+        print("Find My monitor stopped.")
+
+
 async def main():
 
     parser = argparse.ArgumentParser(
@@ -1306,6 +1870,18 @@ async def main():
         help=(
             "Bluetooth name "
             f"(default: {DEVICE_NAME})"
+        )
+    )
+
+
+    parser.add_argument(
+        "--usb",
+        metavar="PORT",
+        default=None,
+        help=(
+            "Use Flipper USB CDC RPC transport, "
+            "for example "
+            "/dev/cu.usbmodemflip_ZER0TYEC1"
         )
     )
 
@@ -1332,6 +1908,29 @@ async def main():
     sub.add_parser(
         "pcmon-start",
         help="Start PC Monitor using shared Flipper RPC session"
+    )
+
+    marauder_parser = sub.add_parser(
+        "marauder",
+        help="Send Marauder CLI command over BLE RPC -> UART"
+    )
+
+    marauder_parser.add_argument(
+        "marauder_command",
+        nargs="+",
+        help="Marauder CLI command"
+    )
+
+
+    sub.add_parser(
+        "marauder-terminal",
+        help="Interactive persistent Marauder terminal over BLE RPC"
+    )
+
+
+    sub.add_parser(
+        "marauder-findmy",
+        help="Monitor Apple Find My 4C001219 BLE advertisements"
     )
 
     cat_parser = sub.add_parser(
@@ -1427,7 +2026,10 @@ async def main():
 
     args = parser.parse_args()
 
-    flipper = FlipperBLE(args.device)
+    flipper = FlipperBLE(
+        args.device,
+        usb_port=args.usb
+    )
 
     try:
 
@@ -1482,6 +2084,31 @@ async def main():
             elif args.command == "pcmon-start":
                 await flipper.pcmon_start()
                 print("PC Monitor RPC mode started")
+
+            elif args.command == "marauder":
+
+                command = " ".join(
+                    args.marauder_command
+                )
+
+                await cmd_marauder(
+                    flipper,
+                    command
+                )
+
+
+            elif args.command == "marauder-terminal":
+
+                await cmd_marauder_terminal(
+                    flipper
+                )
+
+
+            elif args.command == "marauder-findmy":
+
+                await cmd_marauder_findmy(
+                    flipper
+                )
 
 
             elif args.command == "put":
