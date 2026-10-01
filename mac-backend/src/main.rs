@@ -7,12 +7,12 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use tokio::time::{sleep, timeout, Duration};
 
 mod flipper_manager;
@@ -62,6 +62,25 @@ static STALE_ADVERTISEMENT_LOGGED: AtomicBool = AtomicBool::new(false);
  */
 
 const RPC_SOCKET_PATH: &str = "/tmp/flipper-pcmonitor-rpc.sock";
+
+
+const RPC_EVENT_SOCKET_PATH: &str = "/tmp/flipper-pcmonitor-events.sock";
+
+/*
+ * Every decoded inbound PB.Main frame is copied onto this broadcast
+ * channel. Normal RPC handling continues unchanged.
+ *
+ * This gives long-lived tools such as marauder-findmy a passive RX
+ * path without letting them own the BLE notification stream.
+ */
+static RPC_EVENT_TX: OnceLock<broadcast::Sender<Vec<u8>>> = OnceLock::new();
+
+fn publish_rpc_event(frame: &[u8]) {
+    if let Some(tx) = RPC_EVENT_TX.get() {
+        let _ = tx.send(frame.to_vec());
+    }
+}
+
 
 const RPC_ACTIVE_MARKER: &str = "/tmp/flipper-pcmonitor-rpc-active";
 
@@ -223,6 +242,94 @@ async fn handle_proxy_client(mut stream: UnixStream, proxy_tx: mpsc::Sender<Prox
                 if stream.write_all(payload).await.is_err() {
                     return;
                 }
+            }
+        }
+    }
+}
+
+
+async fn handle_event_client(
+    mut stream: UnixStream,
+    mut event_rx: broadcast::Receiver<Vec<u8>>,
+) {
+    loop {
+        let frame = match event_rx.recv().await {
+            Ok(frame) => frame,
+
+            /*
+             * A slow observer must never affect BLE/RPC.
+             * Drop old monitoring frames and continue with fresh data.
+             */
+            Err(broadcast::error::RecvError::Lagged(_)) => {
+                continue;
+            }
+
+            Err(broadcast::error::RecvError::Closed) => {
+                return;
+            }
+        };
+
+        /*
+         * Event wire format:
+         *
+         *   u32 little-endian protobuf frame length
+         *   raw serialized PB.Main bytes
+         *
+         * Unlike the normal RPC socket, this is one-way.
+         */
+        let len = frame.len() as u32;
+
+        if stream.write_all(&len.to_le_bytes()).await.is_err() {
+            return;
+        }
+
+        if stream.write_all(&frame).await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn rpc_event_socket_server() {
+    let _ = std::fs::remove_file(RPC_EVENT_SOCKET_PATH);
+
+    let listener = match UnixListener::bind(RPC_EVENT_SOCKET_PATH) {
+        Ok(listener) => listener,
+
+        Err(err) => {
+            eprintln!("RPC event socket bind failed: {}", err);
+            return;
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        if let Err(err) = std::fs::set_permissions(
+            RPC_EVENT_SOCKET_PATH,
+            std::fs::Permissions::from_mode(0o600),
+        ) {
+            eprintln!("RPC event socket permission warning: {}", err);
+        }
+    }
+
+    println!("RPC event stream listening on {}", RPC_EVENT_SOCKET_PATH);
+
+    loop {
+        match listener.accept().await {
+            Ok((stream, _)) => {
+                let Some(tx) = RPC_EVENT_TX.get() else {
+                    continue;
+                };
+
+                let rx = tx.subscribe();
+
+                tokio::spawn(handle_event_client(stream, rx));
+            }
+
+            Err(err) => {
+                eprintln!("RPC event socket accept failed: {}", err);
+                sleep(Duration::from_secs(1)).await;
             }
         }
     }
@@ -609,6 +716,7 @@ where
         rx_buffer.extend_from_slice(&notification.value);
 
         while let Some(frame) = take_delimited_frame(rx_buffer) {
+                publish_rpc_event(&frame);
             if let Some(state) = parse_app_state_response(&frame) {
                 /*
                  * APP_STARTED = 1
@@ -653,6 +761,7 @@ where
             rx_buffer.extend_from_slice(&notification.value);
 
             while let Some(frame) = take_delimited_frame(rx_buffer) {
+                publish_rpc_event(&frame);
                 if let Some((response_id, status, has_next)) = parse_main_status(&frame) {
                     if response_id != command_id {
                         continue;
@@ -705,6 +814,7 @@ where
             rx_buffer.extend_from_slice(&notification.value);
 
             while let Some(frame) = take_delimited_frame(rx_buffer) {
+                publish_rpc_event(&frame);
                 if let Some((response_id, _status, has_next)) = parse_main_status(&frame) {
                     if response_id != command_id {
                         continue;
@@ -1069,6 +1179,7 @@ where
             rx_buffer.extend_from_slice(&notification.value);
 
             while let Some(frame) = take_delimited_frame(rx_buffer) {
+                publish_rpc_event(&frame);
                 if let Some((response_id, status, has_next)) = parse_main_status(&frame) {
                     if response_id != command_id {
                         continue;
@@ -1596,6 +1707,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let proxy_rx: ProxyReceiver = Arc::new(Mutex::new(proxy_rx_raw));
 
     tokio::spawn(rpc_socket_server(proxy_tx));
+
+    /*
+     * Passive multi-client RPC event stream.
+     *
+     * Capacity is intentionally generous; lagging observers drop old
+     * frames rather than slowing PC Monitor or normal RPC traffic.
+     */
+    let (event_tx, _) = broadcast::channel::<Vec<u8>>(256);
+
+    RPC_EVENT_TX
+        .set(event_tx)
+        .map_err(|_| "RPC event channel already initialized")?;
+
+    tokio::spawn(rpc_event_socket_server());
 
     /*
      * BLE supervision loop.
